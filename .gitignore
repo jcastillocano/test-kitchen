@@ -3,6 +3,7 @@
 .bundle
 .config
 .yardoc
+binstubs
 Gemfile*.lock
 InstalledFiles
 _yardoc
@@ -22,3 +23,4 @@ tmp
 .kitchen/
 .kitchen.yml
 .kitchen.local.yml
+Berksfile.lock

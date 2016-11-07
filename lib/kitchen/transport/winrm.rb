@@ -42,11 +42,12 @@ module Kitchen
 
       default_config :username, "administrator"
       default_config :password, nil
+      default_config :elevated, false
       default_config :rdp_port, 3389
       default_config :connection_retries, 5
       default_config :connection_retry_sleep, 1
       default_config :max_wait_until_ready, 600
-      default_config :winrm_transport, "plaintext"
+      default_config :winrm_transport, :negotiate
       default_config :port do |transport|
         transport[:winrm_transport] == :ssl ? 5986 : 5985
       end
@@ -58,18 +59,7 @@ module Kitchen
       def finalize_config!(instance)
         super
 
-        transport = config[:winrm_transport].to_sym
-        config[:winrm_transport] =
-         case transport
-         when :sspinegotiate
-           if host_os_windows?
-             transport
-           else
-             :plaintext
-           end
-         else
-           transport
-         end
+        config[:winrm_transport] = config[:winrm_transport].to_sym
 
         self
       end
@@ -94,14 +84,12 @@ module Kitchen
       class Connection < Kitchen::Transport::Base::Connection
         # (see Base::Connection#close)
         def close
-          return if @session.nil?
-
-          shell_id = session.shell
-          logger.debug("[WinRM] closing remote shell #{shell_id} on #{self}")
-          session.close
-          logger.debug("[WinRM] remote shell #{shell_id} closed")
+          @unelevated_session.close if @unelevated_session
+          @elevated_session.close if @elevated_session
         ensure
-          @session = nil
+          @unelevated_session = nil
+          @elevated_session = nil
+          @file_transporter = nil
         end
 
         # (see Base::Connection#execute)
@@ -109,17 +97,16 @@ module Kitchen
           return if command.nil?
           logger.debug("[WinRM] #{self} (#{command})")
 
-          if command.length > MAX_COMMAND_SIZE
-            command = run_from_file_command(command)
-          end
           exit_code, stderr = execute_with_exit_code(command)
 
           if logger.debug? && exit_code == 0
             log_stderr_on_warn(stderr)
           elsif exit_code != 0
             log_stderr_on_warn(stderr)
-            raise Transport::WinrmFailed,
-              "WinRM exited (#{exit_code}) for command: [#{command}]"
+            raise Transport::WinrmFailed.new(
+              "WinRM exited (#{exit_code}) for command: [#{command}]",
+              exit_code
+            )
           end
         end
 
@@ -146,11 +133,9 @@ module Kitchen
         # (see Base::Connection#wait_until_ready)
         def wait_until_ready
           delay = 3
-          session(
-            :retries => max_wait_until_ready / delay,
-            :delay => delay,
-            :message => "Waiting for WinRM service on #{endpoint}, " \
-              "retrying in #{delay} seconds"
+          unelevated_session(
+            :retry_limit => max_wait_until_ready / delay,
+            :retry_delay => delay
           )
           execute(PING_COMMAND.dup)
         end
@@ -158,21 +143,6 @@ module Kitchen
         private
 
         PING_COMMAND = "Write-Host '[WinRM] Established\n'".freeze
-
-        # Maximum string to send to the transport to execute. WinRM has an 8000 character
-        # command line limit. The original command string is coverted to a base 64 encoded
-        # UTF-16 string which will double the string size.
-        MAX_COMMAND_SIZE = 3000
-
-        RESCUE_EXCEPTIONS_ON_ESTABLISH = lambda do
-          [
-            Errno::EACCES, Errno::EADDRINUSE, Errno::ECONNREFUSED, Errno::ETIMEDOUT,
-            Errno::ECONNRESET, Errno::ENETUNREACH, Errno::EHOSTUNREACH,
-            ::WinRM::WinRMHTTPTransportError, ::WinRM::WinRMAuthorizationError,
-            HTTPClient::KeepAliveDisconnected,
-            HTTPClient::ConnectTimeoutError
-          ].freeze
-        end
 
         # @return [Integer] how many times to retry when failing to execute
         #   a command or transfer files
@@ -183,10 +153,6 @@ module Kitchen
         #   when failing to execute a command or transfer files
         # @api private
         attr_reader :connection_retry_sleep
-
-        # @return [String] the endpoint URL of the remote WinRM host
-        # @api private
-        attr_reader :endpoint
 
         # @return [String] display name for the associated instance
         # @api private
@@ -206,10 +172,9 @@ module Kitchen
         # @api private
         attr_reader :rdp_port
 
-        # @return [Symbol] the transport strategy to use when constructing a
-        #   `WinRM::WinRMWebService`
+        # @return [Boolean] whether to use winrm-elevated for running commands
         # @api private
-        attr_reader :winrm_transport
+        attr_reader :elevated
 
         # Writes an RDP document to the local file system.
         #
@@ -219,7 +184,7 @@ module Kitchen
         # @api private
         def create_rdp_doc(opts = {})
           content = Util.outdent!(<<-RDP)
-            full address:s:#{URI.parse(endpoint).host}:#{rdp_port}
+            full address:s:#{URI.parse(options[:endpoint]).host}:#{rdp_port}
             prompt for credentials:i:1
             username:s:#{options[:user]}
           RDP
@@ -235,31 +200,6 @@ module Kitchen
           end
         end
 
-        # Establish a remote shell session on the remote host.
-        #
-        # @param opts [Hash] retry options
-        # @option opts [Integer] :retries the number of times to retry before
-        #   failing
-        # @option opts [Float] :delay the number of seconds to wait until
-        #   attempting a retry
-        # @option opts [String] :message an optional message to be logged on
-        #   debug (overriding the default) when a rescuable exception is raised
-        # @return [Winrm::CommandExecutor] the command executor session
-        # @api private
-        def establish_shell(opts)
-          service_args = [endpoint, winrm_transport, options]
-          @service = ::WinRM::WinRMWebService.new(*service_args)
-          closer = WinRM::Transport::ShellCloser.new("#{self}", logger.debug?, service_args)
-
-          executor = WinRM::Transport::CommandExecutor.new(@service, logger, closer)
-          retryable(opts) do
-            logger.debug("[WinRM] opening remote shell on #{self}")
-            shell_id = executor.open
-            logger.debug("[WinRM] remote shell #{shell_id} is open on #{self}")
-          end
-          executor
-        end
-
         # Execute a Powershell script over WinRM and return the command's
         # exit code and standard error.
         #
@@ -268,17 +208,27 @@ module Kitchen
         #   script and the standard error stream
         # @api private
         def execute_with_exit_code(command)
-          response = session.run_powershell_script(command) do |stdout, _|
-            logger << stdout if stdout
+          if elevated
+            session = elevated_session
+            command = "$env:temp='#{unelevated_temp_dir}';#{command}"
+          else
+            session = unelevated_session
           end
 
-          [response[:exitcode], response.stderr]
+          response = session.run(command) do |stdout, _|
+            logger << stdout if stdout
+          end
+          [response.exitcode, response.stderr]
+        end
+
+        def unelevated_temp_dir
+          @unelevated_temp_dir ||= unelevated_session.run("$env:temp").stdout.chomp
         end
 
         # @return [Winrm::FileTransporter] a file transporter
         # @api private
         def file_transporter
-          @file_transporter ||= WinRM::Transport::FileTransporter.new(session, logger)
+          @file_transporter ||= WinRM::FS::Core::FileTransporter.new(unelevated_session)
         end
 
         # (see Base#init_options)
@@ -286,12 +236,11 @@ module Kitchen
           super
           @instance_name      = @options.delete(:instance_name)
           @kitchen_root       = @options.delete(:kitchen_root)
-          @endpoint           = @options.delete(:endpoint)
           @rdp_port           = @options.delete(:rdp_port)
-          @winrm_transport    = @options.delete(:winrm_transport)
           @connection_retries = @options.delete(:connection_retries)
           @connection_retry_sleep = @options.delete(:connection_retry_sleep)
           @max_wait_until_ready   = @options.delete(:max_wait_until_ready)
+          @elevated           = @options.delete(:elevated)
         end
 
         # Logs formatted standard error output at the warning level.
@@ -321,8 +270,8 @@ module Kitchen
         # @api private
         def login_command_for_linux
           args  = %W[-u #{options[:user]}]
-          args += %W[-p #{options[:pass]}] if options.key?(:pass)
-          args += %W[#{URI.parse(endpoint).host}:#{rdp_port}]
+          args += %W[-p #{options[:password]}] if options.key?(:password)
+          args += %W[#{URI.parse(options[:endpoint]).host}:#{rdp_port}]
 
           LoginCommand.new("rdesktop", args)
         end
@@ -353,49 +302,45 @@ module Kitchen
           File.join(kitchen_root, ".kitchen", "#{instance_name}.rdp")
         end
 
-        # Yields to a block and reties the block if certain rescuable
-        # exceptions are raised.
-        #
-        # @param opts [Hash] retry options
-        # @option opts [Integer] :retries the number of times to retry before
-        #   failing
-        # @option opts [Float] :delay the number of seconds to wait until
-        #   attempting a retry
-        # @option opts [String] :message an optional message to be logged on
-        #   debug (overriding the default) when a rescuable exception is raised
-        # @return [Winrm::CommandExecutor] the command executor session
-        # @api private
-        def retryable(opts)
-          yield
-        rescue *RESCUE_EXCEPTIONS_ON_ESTABLISH.call => e
-          if (opts[:retries] -= 1) > 0
-            message = if opts[:message]
-              logger.debug("[WinRM] connection failed (#{e.inspect})")
-              opts[:message]
-            else
-              "[WinRM] connection failed, " \
-                "retrying in #{opts[:delay]} seconds (#{e.inspect})"
-            end
-            logger.info(message)
-            sleep(opts[:delay])
-            retry
-          else
-            logger.warn("[WinRM] connection failed, terminating (#{e.inspect})")
-            raise
-          end
-        end
-
         # Establishes a remote shell session, or establishes one when invoked
         # the first time.
         #
         # @param retry_options [Hash] retry options for the initial connection
-        # @return [Winrm::CommandExecutor] the command executor session
+        # @return [Winrm::Shells::Powershell] the command shell session
         # @api private
-        def session(retry_options = {})
-          @session ||= establish_shell({
-            :retries => connection_retries.to_i,
-            :delay => connection_retry_sleep.to_i
-          }.merge(retry_options))
+        def unelevated_session(retry_options = {})
+          @unelevated_session ||= connection(retry_options).shell(:powershell)
+        end
+
+        # Creates an elevated session for running commands via a scheduled task
+        #
+        # @return [Winrm::Shells::Elevated] the elevated shell
+        # @api private
+        def elevated_session(retry_options = {})
+          @elevated_session ||= begin
+            connection(retry_options).shell(:elevated).tap do |shell|
+              shell.username = options[:elevated_username]
+              shell.password = options[:elevated_password]
+            end
+          end
+        end
+
+        # Creates a winrm Connection instance
+        #
+        # @param retry_options [Hash] retry options for the initial connection
+        # @return [Winrm::Connection] the winrm connection
+        # @api private
+        def connection(retry_options = {})
+          @connection ||= begin
+            opts = {
+              :retry_limit => connection_retries.to_i,
+              :retry_delay   => connection_retry_sleep.to_i
+            }.merge(retry_options)
+
+            ::WinRM::Connection.new(options.merge(opts)).tap do |conn|
+              conn.logger = logger
+            end
+          end
         end
 
         # String representation of object, reporting its connection details and
@@ -403,38 +348,15 @@ module Kitchen
         #
         # @api private
         def to_s
-          "#{winrm_transport}::#{endpoint}<#{options.inspect}>"
-        end
-
-        # takes a long (greater than 3000 characters) command and saves it to a
-        # file and uploads it to the test instance.
-        #
-        # @param command [String] a long command to be saved and uploaded
-        # @return [String] a command that executes the uploaded script
-        # @api private
-        def run_from_file_command(command)
-          temp_dir = Dir.mktmpdir("kitchen-long-script")
-          begin
-            script_name = "#{instance_name}-long_script.ps1"
-            script_path = File.join(temp_dir, script_name)
-
-            File.open(script_path, "wb") do |file|
-              file.write(command)
-            end
-
-            target_path = File.join("$env:TEMP", "kitchen")
-            upload(script_path, target_path)
-
-            %{& "#{File.join(target_path, script_name)}"}
-          ensure
-            FileUtils.rmtree(temp_dir)
-          end
+          "<#{options.inspect}>"
         end
       end
 
       private
 
-      WINRM_TRANSPORT_SPEC_VERSION = ["~> 1.0", ">= 1.0.3"].freeze
+      WINRM_SPEC_VERSION = ["~> 2.0"].freeze
+      WINRM_FS_SPEC_VERSION = ["~> 1.0"].freeze
+      WINRM_ELEVATED_SPEC_VERSION = ["~> 1.0"].freeze
 
       # Builds the hash of options needed by the Connection object on
       # construction.
@@ -443,26 +365,32 @@ module Kitchen
       # @return [Hash] hash of connection options
       # @api private
       def connection_options(data)
+        elevated_password = data[:password]
+        elevated_password = data[:elevated_password] if data.key?(:elevated_password)
+
         opts = {
           :instance_name => instance.name,
           :kitchen_root => data[:kitchen_root],
           :logger => logger,
           :endpoint => data[:endpoint_template] % data,
           :user => data[:username],
-          :pass => data[:password],
+          :password => data[:password],
           :rdp_port => data[:rdp_port],
           :connection_retries => data[:connection_retries],
           :connection_retry_sleep => data[:connection_retry_sleep],
           :max_wait_until_ready => data[:max_wait_until_ready],
-          :winrm_transport => data[:winrm_transport]
+          :transport => data[:winrm_transport],
+          :elevated => data[:elevated],
+          :elevated_username => data[:elevated_username] || data[:username],
+          :elevated_password => elevated_password
         }
-        opts.merge!(additional_transport_args(opts[:winrm_transport]))
+        opts.merge!(additional_transport_args(opts[:transport]))
         opts
       end
 
       def additional_transport_args(transport_type)
-        case transport_type
-        when :ssl, :sspinegotiate
+        case transport_type.to_sym
+        when :ssl, :negotiate
           {
             :no_ssl_peer_verification => true,
             :disable_sspi => false,
@@ -473,6 +401,8 @@ module Kitchen
             :disable_sspi => true,
             :basic_auth_only => true
           }
+        else
+          {}
         end
       end
 
@@ -495,66 +425,28 @@ module Kitchen
       # (see Base#load_needed_dependencies!)
       def load_needed_dependencies!
         super
-        load_winrm_transport!
-        load_winrm_s! if host_os_windows?
+        load_with_rescue!("winrm", WINRM_SPEC_VERSION.dup)
+        load_with_rescue!("winrm-fs", WINRM_FS_SPEC_VERSION.dup)
+        load_with_rescue!("winrm-elevated", WINRM_ELEVATED_SPEC_VERSION.dup) if config[:elevated]
       end
 
-      # Load WinRM::Transport code.
-      #
-      # @api private
-      def load_winrm_transport!
-        spec_version = WINRM_TRANSPORT_SPEC_VERSION.dup
-        options = {
-          :load_msg => "Winrm Transport requested," \
-          " loading WinRM::Transport gem (#{spec_version})",
-          :success_msg => "WinRM::Transport library loaded",
-          :already_msg => "WinRM::Transport previously loaded",
-          :name => "winrm-transport",
-          :version => spec_version
-        }
-
-        load_with_rescue!(options) do
-          gem "winrm-transport", WINRM_TRANSPORT_SPEC_VERSION.dup
-          require "winrm/transport/version"
-        end
-
-        silence_warnings { require "winrm" }
-        require "winrm/transport/shell_closer"
-        require "winrm/transport/command_executor"
-        require "winrm/transport/file_transporter"
-      end
-
-      def load_winrm_s!
-        options = {
-          :load_msg => "The winrm-s gem is being loaded" \
-          " to enable sspiauthentication.",
-          :success_msg => "winrm-s is loaded." \
-            "  sspinegotiate auth is now available.",
-          :already_msg => "winrm-s was already loaded.",
-          :name => "winrm-s"
-        }
-
-        load_with_rescue!(options) { require "winrm-s" }
-      end
-
-      def load_with_rescue!(options = {}, &block)
-        logger.debug(options[:load_msg])
-        attempt_load = execute_block(&block)
+      def load_with_rescue!(gem_name, spec_version)
+        logger.debug("#{gem_name} requested," \
+          " loading #{gem_name} gem (#{spec_version})")
+        attempt_load = false
+        gem gem_name, spec_version
+        silence_warnings { attempt_load = require gem_name }
         if attempt_load
-          logger.debug(options[:success_msg])
+          logger.debug("#{gem_name} is loaded.")
         else
-          logger.debug(options[:already_msg])
+          logger.debug("#{gem_name} was already loaded.")
         end
       rescue LoadError => e
-        message = fail_to_load_gem_message(options[:name],
-          options[:version])
+        message = fail_to_load_gem_message(gem_name,
+          spec_version)
         logger.fatal(message)
         raise UserError,
-          "Could not load or activate #{options[:name]}. (#{e.message})"
-      end
-
-      def execute_block
-        yield if block_given?
+          "Could not load or activate #{gem_name}. (#{e.message})"
       end
 
       def fail_to_load_gem_message(name, version = nil)

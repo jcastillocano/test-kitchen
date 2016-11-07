@@ -10,15 +10,17 @@ receive a veto from the Lieutenant or the Project Lead.
 * [Fletcher Nichol](https://github.com/fnichol)
 
 ## Lieutenants
-* [Tyler Ball](https://github.com/tyler-ball)
+* [Seth Thomas](https://github.com/cheeseplus)
 
 ## Maintainers
 
-* [Seth Thomas](https://github.com/cheeseplus)
 * [Adam Leff](https://github.com/adamleff)
-* [Jennifer Davis](https://github.com/iennae)
-* [Matt Wrock](https://github.com/mwrock)
-* [Steven Murawski](http://github.com/smurawski)
 * [Chris Hartmann](https://github.com/chris-rock)
-* [Sean Omeara](http://github.com/someara)
+* [Jennifer Davis](https://github.com/iennae)
+* [Kimball Johnson](https://github.com/drrk)
+* [Lamont Granquist](https://github.com/lamont-granquist)
+* [Matt Wrock](https://github.com/mwrock)
+* [Noah Kantrowitz](https://github.com/coderanger)
 * [Robb Kidd](https://github.com/robbkidd)
+* [Sean Omeara](http://github.com/someara)
+* [Steven Murawski](http://github.com/smurawski)

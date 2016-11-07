@@ -32,6 +32,10 @@ module Kitchen
       default_config :https_proxy, nil
       default_config :ftp_proxy, nil
 
+      default_config :retry_on_exit_code, []
+      default_config :max_retries, 1
+      default_config :wait_for_retry, 30
+
       default_config :root_path do |provisioner|
         provisioner.windows_os? ? "$env:TEMP\\kitchen" : "/tmp/kitchen"
       end
@@ -59,6 +63,7 @@ module Kitchen
       #
       # @param state [Hash] mutable instance state
       # @raise [ActionFailed] if the action could not be completed
+      # rubocop:disable Metrics/AbcSize
       def call(state)
         create_sandbox
         sandbox_dirs = Dir.glob(File.join(sandbox_path, "*"))
@@ -70,7 +75,12 @@ module Kitchen
           conn.upload(sandbox_dirs, config[:root_path])
           debug("Transfer complete")
           conn.execute(prepare_command)
-          conn.execute(run_command)
+          conn.execute_with_retry(
+            run_command,
+            config[:retry_on_exit_code],
+            config[:max_retries],
+            config[:wait_for_retry]
+          )
         end
       rescue Kitchen::Transport::TransportFailed => ex
         raise ActionFailed, ex.message
@@ -205,10 +215,18 @@ module Kitchen
       # Conditionally prefixes a command with a sudo command.
       #
       # @param command [String] command to be prefixed
-      # @return [String] the command, conditionaly prefixed with sudo
+      # @return [String] the command, conditionally prefixed with sudo
       # @api private
       def sudo(script)
-        config[:sudo] ? "#{config[:sudo_command]} #{script}" : script
+        "#{sudo_command} #{script}".lstrip
+      end
+
+      # Returns the sudo command to use or empty string if sudo is not configured
+      #
+      # @return [String] the sudo command if sudo config is true
+      # @api private
+      def sudo_command
+        config[:sudo] ? config[:sudo_command].to_s : ""
       end
 
       # Conditionally prefixes a command with a command prefix.

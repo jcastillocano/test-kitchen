@@ -29,7 +29,7 @@ describe Kitchen::Provisioner::ChefSolo do
   let(:suite)           { stub(:name => "fries") }
 
   let(:config) do
-    { :test_base_path => "/b", :kitchen_root => "/r", :log_level => :info }
+    { :test_base_path => "/b", :kitchen_root => "/r" }
   end
 
   let(:instance) do
@@ -401,6 +401,11 @@ describe Kitchen::Provisioner::ChefSolo do
         cmd.must_match regexify(" --log_level auto", :partial_line)
       end
 
+      it "sets log level flag on chef-solo to info by default if running Chef < 11" do
+        config[:require_chef_omnibus] = "10.34.6"
+        cmd.must_match regexify(" --log_level info", :partial_line)
+      end
+
       it "set log level flag for custom level" do
         config[:log_level] = :extreme
 
@@ -409,6 +414,11 @@ describe Kitchen::Provisioner::ChefSolo do
 
       it "sets force formatter flag on chef-solo" do
         cmd.must_match regexify(" --force-formatter", :partial_line)
+      end
+
+      it "does not set force formatter flag on chef-solo if running Chef < 11" do
+        config[:require_chef_omnibus] = "10.34.6"
+        cmd.wont_match regexify(" --force-formatter", :partial_line)
       end
 
       it "sets no color flag on chef-solo" do
@@ -436,6 +446,18 @@ describe Kitchen::Provisioner::ChefSolo do
         config[:profile_ruby] = false
 
         cmd.wont_match regexify(" --profile-ruby", :partial_line)
+      end
+
+      it "sets legacy-mode flag when config element is set" do
+        config[:legacy_mode] = true
+
+        cmd.must_match regexify(" --legacy-mode", :partial_line)
+      end
+
+      it "does not set legacy-mode flag when config element is falsey" do
+        config[:legacy_mode] = false
+
+        cmd.wont_match regexify(" --legacy-mode", :partial_line)
       end
     end
 
@@ -477,8 +499,9 @@ describe Kitchen::Provisioner::ChefSolo do
       end
 
       it "reloads PATH for older chef omnibus packages" do
-        cmd.must_match regexify("$env:PATH = " +
-          %{[System.Environment]::GetEnvironmentVariable("PATH","Machine")})
+        cmd.must_match regexify("$env:PATH = try {\n" \
+        "[System.Environment]::GetEnvironmentVariable('PATH','Machine')\n" \
+        "} catch { $env:PATH }")
       end
 
       it "calls the chef-solo command from :chef_solo_path" do

@@ -21,13 +21,20 @@ require "pathname"
 require "json"
 require "cgi"
 
+require "kitchen/provisioner/chef/policyfile"
 require "kitchen/provisioner/chef/berkshelf"
 require "kitchen/provisioner/chef/common_sandbox"
 require "kitchen/provisioner/chef/librarian"
 require "kitchen/util"
 require "mixlib/install"
-require "chef-config/config"
-require "chef-config/workstation_config_loader"
+require "mixlib/install/script_generator"
+
+begin
+  require "chef-config/config"
+  require "chef-config/workstation_config_loader"
+rescue LoadError # rubocop:disable Lint/HandleExceptions
+  # This space left intentionally blank.
+end
 
 module Kitchen
 
@@ -39,18 +46,29 @@ module Kitchen
     class ChefBase < Base
 
       default_config :require_chef_omnibus, true
-      default_config :chef_omnibus_url, "https://www.chef.io/chef/install.sh"
+      default_config :chef_omnibus_url, "https://omnitruck.chef.io/install.sh"
       default_config :chef_omnibus_install_options, nil
       default_config :run_list, []
       default_config :attributes, {}
       default_config :config_path, nil
       default_config :log_file, nil
+      default_config :log_level, "auto"
       default_config :profile_ruby, false
+      # The older policyfile_zero used `policyfile` so support it for compat.
+      default_config :policyfile, nil
+      # Will try to autodetect by searching for `Policyfile.rb` if not set.
+      # If set, will error if the file doesn't exist.
+      default_config :policyfile_path, nil
+      # If set to true (which is the default from `chef generate`), try to update
+      # backend cookbook downloader on every kitchen run.
+      default_config :always_update_cookbooks, false
       default_config :cookbook_files_glob, %w[
         README.* metadata.{json,rb}
         attributes/**/* definitions/**/* files/**/* libraries/**/*
         providers/**/* recipes/**/* resources/**/* templates/**/*
       ].join(",")
+      # to ease upgrades, allow the user to turn deprecation warnings into errors
+      default_config :deprecations_as_errors, false
 
       default_config :data_path do |provisioner|
         provisioner.calculate_path("data")
@@ -96,15 +114,18 @@ module Kitchen
       def initialize(config = {})
         super(config)
 
-        ChefConfig::WorkstationConfigLoader.new(config[:config_path]).load
+        if defined?(ChefConfig::WorkstationConfigLoader)
+          ChefConfig::WorkstationConfigLoader.new(config[:config_path]).load
+        end
         # This exports any proxy config present in the Chef config to
         # appropriate environment variables, which Test Kitchen respects
-        ChefConfig::Config.export_proxies
+        ChefConfig::Config.export_proxies if defined?(ChefConfig::Config.export_proxies)
       end
 
       # (see Base#create_sandbox)
       def create_sandbox
         super
+        sanity_check_sandbox_options!
         Chef::CommonSandbox.new(config, sandbox_path, instance).populate
       end
 
@@ -126,18 +147,8 @@ module Kitchen
 
       # (see Base#install_command)
       def install_command
-        return unless config[:require_chef_omnibus]
-
-        version = config[:require_chef_omnibus].to_s.downcase
-
-        # Passing "true" to mixlib-install currently breaks the windows metadata_url
-        # TODO: remove this line once https://github.com/chef/mixlib-install/pull/22
-        # is accepted and released
-        version = "" if version == "true" && powershell_shell?
-
-        installer = Mixlib::Install.new(version, powershell_shell?, install_options)
-        config[:chef_omnibus_root] = installer.root
-        prefix_command(sudo(installer.install_command))
+        return unless config[:require_chef_omnibus] || config[:product_name]
+        prefix_command(sudo(install_script_contents))
       end
 
       private
@@ -149,12 +160,22 @@ module Kitchen
         {
           :omnibus_url => config[:chef_omnibus_url],
           :project => project.nil? ? nil : project[1],
-          :install_flags => config[:chef_omnibus_install_options]
+          :install_flags => config[:chef_omnibus_install_options],
+          :sudo_command => sudo_command
         }.tap do |opts|
           opts[:root] = config[:chef_omnibus_root] if config.key? :chef_omnibus_root
-          opts[:http_proxy] = config[:http_proxy] if config.key? :http_proxy
-          opts[:https_proxy] = config[:https_proxy] if config.key? :https_proxy
+          [:install_msi_url, :http_proxy, :https_proxy].each do |key|
+            opts[key] = config[key] if config.key? key
+          end
         end
+      end
+
+      # @return [String] an absolute path to a Policyfile, relative to the
+      #   kitchen root
+      # @api private
+      def policyfile
+        policyfile_basename = config[:policyfile_path] || config[:policyfile] || "Policyfile.rb"
+        File.join(config[:kitchen_root], policyfile_basename)
       end
 
       # @return [String] an absolute path to a Berksfile, relative to the
@@ -199,7 +220,8 @@ module Kitchen
           :chef_server_url  => "http://127.0.0.1:8889",
           :encrypted_data_bag_secret => remote_path_join(
             root, "encrypted_data_bag_secret"
-          )
+          ),
+          :treat_deprecation_warnings_as_errors => config[:deprecations_as_errors]
         }
       end
 
@@ -263,24 +285,95 @@ module Kitchen
       # (see Base#load_needed_dependencies!)
       def load_needed_dependencies!
         super
-        if File.exist?(berksfile)
+        if File.exist?(policyfile)
+          debug("Policyfile found at #{policyfile}, using Policyfile to resolve dependencies")
+          Chef::Policyfile.load!(:logger => logger)
+        elsif File.exist?(berksfile)
           debug("Berksfile found at #{berksfile}, loading Berkshelf")
-          Chef::Berkshelf.load!(logger)
+          Chef::Berkshelf.load!(:logger => logger)
         elsif File.exist?(cheffile)
           debug("Cheffile found at #{cheffile}, loading Librarian-Chef")
-          Chef::Librarian.load!(logger)
+          Chef::Librarian.load!(:logger => logger)
         end
       end
 
-      # @return [String] a powershell command to reload the `PATH` environment
-      #   variable, only to be used to support old Omnibus Chef packages that
-      #   require `PATH` to find the `ruby.exe` binary
+      # @return [String] contents of the install script
       # @api private
-      def reload_ps1_path
-        [
-          %{$env:PATH},
-          %{[System.Environment]::GetEnvironmentVariable("PATH","Machine")\n\n}
-        ].join(" = ")
+      def install_script_contents
+        # by default require_chef_omnibus is set to true. Check config[:product_name] first
+        # so that we can use it if configured.
+        if config[:product_name]
+          script_for_product
+        elsif config[:require_chef_omnibus]
+          script_for_omnibus_version
+        end
+      end
+
+      # @return [String] contents of product based install script
+      # @api private
+      def script_for_product
+        installer = Mixlib::Install.new({
+          :product_name => config[:product_name],
+          :product_version => config[:product_version],
+          :channel => (config[:channel] || :stable).to_sym
+        }.tap do |opts|
+          opts[:shell_type] = :ps1 if powershell_shell?
+          [:platform, :platform_version, :architecture].each do |key|
+            opts[key] = config[key] if config[key]
+          end
+        end)
+        config[:chef_omnibus_root] = installer.root
+        if powershell_shell?
+          installer.install_command
+        else
+          install_from_file(installer.install_command)
+        end
+      end
+
+      def install_from_file(command)
+        install_file = "/tmp/chef-installer.sh"
+        script = ["cat > #{install_file} <<\"EOL\""]
+        script << "#!/bin/bash"
+        script << command
+        script << "EOL"
+        script << "chmod +x #{install_file}"
+        script << sudo(install_file)
+        script.join("\n")
+      end
+
+      # @return [String] contents of version based install script
+      # @api private
+      def script_for_omnibus_version
+        installer = Mixlib::Install::ScriptGenerator.new(
+          config[:require_chef_omnibus], powershell_shell?, install_options)
+        config[:chef_omnibus_root] = installer.root
+        installer.install_command
+      end
+
+      # Hook used in subclasses to indicate support for policyfiles.
+      #
+      # @abstract
+      # @return [Boolean]
+      # @api private
+      def supports_policyfile?
+        false
+      end
+
+      # @return [void]
+      # @raise [UserError]
+      # @api private
+      def sanity_check_sandbox_options!
+        if (config[:policyfile_path] || config[:policyfile]) && !File.exist?(policyfile)
+          raise UserError, "policyfile_path set in config "\
+            "(#{config[:policyfile_path]} could not be found. " \
+            "Expected to find it at full path #{policyfile} " \
+        end
+        if File.exist?(policyfile) && !supports_policyfile?
+          raise UserError, "policyfile detected, but provisioner " \
+            "#{self.class.name} doesn't support policyfiles. " \
+            "Either use a different provisioner, or delete/rename " \
+            "#{policyfile}"
+        end
       end
     end
   end

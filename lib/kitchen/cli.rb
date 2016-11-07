@@ -91,6 +91,10 @@ module Kitchen
       method_option :log_overwrite,
         :desc => "Set to false to prevent log overwriting each time Test Kitchen runs",
         :type => :boolean
+      method_option :color,
+        :type => :boolean,
+        :lazy_default => $stdout.tty?,
+        :desc => "Toggle color output for STDOUT logger"
     end
 
     # Sets the test_base_path method_options
@@ -106,6 +110,10 @@ module Kitchen
       :aliases => "-b",
       :type => :boolean,
       :desc => "List the name of each instance only, one per line"
+    method_option :json,
+      :aliases => "-j",
+      :type => :boolean,
+      :desc => "Print data as JSON"
     method_option :debug,
       :aliases => "-d",
       :type => :boolean,
@@ -115,6 +123,7 @@ module Kitchen
       update_config!
       perform("list", "list", args)
     end
+    map :status => :list
 
     desc "diagnose [INSTANCE|REGEXP|all]", "Show computed diagnostic configuration"
     method_option :loader,
@@ -131,6 +140,7 @@ module Kitchen
       :type => :boolean,
       :desc => "Include all diagnostics"
     log_options
+    test_base_path
     def diagnose(*args)
       update_config!
       perform("diagnose", "diagnose", args, :loader => @loader)
@@ -232,6 +242,13 @@ module Kitchen
     def login(*args)
       update_config!
       perform("login", "login", args)
+    end
+
+    desc "package INSTANCE|REGEXP", "package an instance"
+    log_options
+    def package(*args)
+      update_config!
+      perform("package", "package", args)
     end
 
     desc "exec INSTANCE|REGEXP -c REMOTE_COMMAND",
@@ -349,6 +366,7 @@ module Kitchen
       unless options[:log_overwrite].nil?
         @config.log_overwrite = options[:log_overwrite]
       end
+      @config.colorize = options[:color] unless options[:color].nil?
 
       if options[:test_base_path]
         # ensure we have an absolute path

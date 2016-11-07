@@ -18,8 +18,6 @@
 
 require_relative "../../spec_helper"
 
-require "net/ssh/test"
-
 require "kitchen/transport/ssh"
 
 # Hack to sort results in `Dir.entries` only within the yielded block, to limit
@@ -55,7 +53,7 @@ end
 # `IO.select` with a version for testing Net::SSH code. Unfortunetly this
 # impacts other code, so we'll "un-patch" this after each spec and "re-patch"
 # it before the next one.
-
+require "net/ssh/test"
 def depatch_io
   IO.class_exec do
     class << self
@@ -63,6 +61,10 @@ def depatch_io
     end
   end
 end
+# We need to immediately call depatch so that `IO.select` is in a good state
+# _right now_.  The require immediately monkeypatches it and we only want
+# it monkey patched inside each ssh test
+depatch_io
 
 def repatch_io
   IO.class_exec do
@@ -82,7 +84,7 @@ end
 # `LocalPacket` which can deal with the `"pty-req"` type.
 #
 # An upstream patch to Net::SSH will be required to retire this yak shave ;)
-
+require "net/ssh/test/channel"
 module Net
 
   module SSH
@@ -146,7 +148,7 @@ describe Kitchen::Transport::Ssh do
     end
 
     it "sets :compression to true by default" do
-      transport[:compression].must_equal true
+      transport[:compression].must_equal false
     end
 
     it "sets :compression to false if set to none" do
@@ -162,13 +164,13 @@ describe Kitchen::Transport::Ssh do
     end
 
     it "sets :compression_level to 6 by default" do
-      transport[:compression_level].must_equal 6
+      transport[:compression_level].must_equal 0
     end
 
-    it "sets :compression_level to 0 if :compression is set to none" do
-      config[:compression] = "none"
+    it "sets :compression_level to 6 if :compression is set to true" do
+      config[:compression] = true
 
-      transport[:compression_level].must_equal 0
+      transport[:compression_level].must_equal 6
     end
 
     it "sets :keepalive to true by default" do
@@ -204,6 +206,10 @@ describe Kitchen::Transport::Ssh do
       config[:ssh_key] = "my_key"
 
       transport[:ssh_key].must_equal os_safe_root_path("/rooty/my_key")
+    end
+
+    it "sets :max_ssh_sessions to 9 by default" do
+      transport[:max_ssh_sessions].must_equal 9
     end
   end
 
@@ -525,6 +531,64 @@ describe Kitchen::Transport::Ssh do
         make_connection
       end
 
+      it "does not set :keys_only if :ssh_key is set in config but password is set" do
+        config[:ssh_key] = "ssh_key_from_config"
+        config[:password] = "password"
+
+        klass.expects(:new).with do |hash|
+          hash[:keys_only].nil?
+        end
+
+        make_connection
+      end
+
+      it "does not set :auth_methods if :ssh_key is set in config but password is set" do
+        config[:ssh_key] = "ssh_key_from_config"
+        config[:password] = "password"
+
+        klass.expects(:new).with do |hash|
+          hash[:auth_methods].nil?
+        end
+
+        make_connection
+      end
+
+      it "does not set :keys_only if :ssh_key is set in state but password is set" do
+        state[:ssh_key] = "ssh_key_from_config"
+        config[:ssh_key] = false
+        config[:password] = "password"
+
+        klass.expects(:new).with do |hash|
+          hash[:keys_only].nil?
+        end
+
+        make_connection
+      end
+
+      it "does not set :keys to an array if :ssh_key is set in config but password is set" do
+        config[:kitchen_root] = "/r"
+        config[:ssh_key] = "ssh_key_from_config"
+        config[:password] = "password"
+
+        klass.expects(:new).with do |hash|
+          hash[:keys].nil?
+        end
+
+        make_connection
+      end
+
+      it "does not set :keys to an array if :ssh_key is set in state but password is set" do
+        state[:ssh_key] = "ssh_key_from_state"
+        config[:ssh_key] = "ssh_key_from_config"
+        config[:password] = "password"
+
+        klass.expects(:new).with do |hash|
+          hash[:keys].nil?
+        end
+
+        make_connection
+      end
+
       it "passes in :password if set in config" do
         config[:password] = "password_from_config"
 
@@ -646,7 +710,13 @@ describe Kitchen::Transport::Ssh::Connection do
   let(:conn)            { net_ssh_connection }
 
   let(:options) do
-    { :logger => logger, :username => "me", :hostname => "foo", :port => 22 }
+    {
+      :logger => logger,
+      :username => "me",
+      :hostname => "foo",
+      :port => 22,
+      :max_ssh_sessions => 9
+    }
   end
 
   let(:connection) do
@@ -888,6 +958,14 @@ describe Kitchen::Transport::Ssh::Connection do
         }.must_raise Kitchen::Transport::SshFailed
         err.message.must_equal "SSH exited (42) for command: [doit]"
       end
+
+      it "returns the exit code with an SshFailed exception" do
+        begin
+          connection.execute("doit")
+        rescue Kitchen::Transport::SshFailed => e
+          e.exit_code.must_equal 42
+        end
+      end
     end
 
     describe "for an interrupted command" do
@@ -1037,19 +1115,6 @@ describe Kitchen::Transport::Ssh::Connection do
           connection.upload(src.path, "/tmp/remote")
         end
       end
-
-      it "logs upload progress to debug" do
-        assert_scripted do
-          connection.upload(src.path, "/tmp/remote")
-        end
-
-        logged_output.string.must_match debug_line(
-          "[SSH] opening connection to me@foo<{:port=>22}>"
-        )
-        logged_output.string.must_match debug_line(
-          "Uploaded #{src.path} (1234 bytes)"
-        )
-      end
     end
 
     describe "for a path" do
@@ -1107,25 +1172,6 @@ describe Kitchen::Transport::Ssh::Connection do
         with_sorted_dir_entries do
           assert_scripted { connection.upload(@dir, "/tmp/remote") }
         end
-      end
-
-      it "logs upload progress to debug" do
-        with_sorted_dir_entries do
-          assert_scripted { connection.upload(@dir, "/tmp/remote") }
-        end
-
-        logged_output.string.must_match debug_line(
-          "[SSH] opening connection to me@foo<{:port=>22}>"
-        )
-        logged_output.string.must_match debug_line(
-          "Uploaded #{@dir}/alpha (15 bytes)"
-        )
-        logged_output.string.must_match debug_line(
-          "Uploaded #{@dir}/subdir/beta (14 bytes)"
-        )
-        logged_output.string.must_match debug_line(
-          "Uploaded #{@dir}/zulu (14 bytes)"
-        )
       end
     end
 

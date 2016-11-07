@@ -229,6 +229,13 @@ module Kitchen
       end
     end
 
+    # Perform package.
+    #
+    def package_action
+      banner "Packaging remote instance"
+      driver.package(state_file.read)
+    end
+
     # Returns a Hash of configuration and other useful diagnostic information.
     #
     # @return [Hash] a diagnostic hash
@@ -281,6 +288,13 @@ module Kitchen
     # @return [String] a named action which was last successfully completed
     def last_action
       state_file.read[:last_action]
+    end
+
+    # Returns the error encountered on the last action on the instance
+    #
+    # @return [String] the message of the last error
+    def last_error
+      state_file.read[:last_error]
     end
 
     # Clean up any per-instance resources before exiting.
@@ -411,6 +425,20 @@ module Kitchen
       self
     end
 
+    # returns true, if the verifier is busser
+    def verifier_busser?(verifier)
+      !defined?(Kitchen::Verifier::Busser).nil? && verifier.is_a?(Kitchen::Verifier::Busser)
+    end
+
+    # returns true, if the verifier is dummy
+    def verifier_dummy?(verifier)
+      !defined?(Kitchen::Verifier::Dummy).nil? && verifier.is_a?(Kitchen::Verifier::Dummy)
+    end
+
+    def use_legacy_ssh_verifier?(verifier)
+      verifier_busser?(verifier) || verifier_dummy?(verifier)
+    end
+
     # Perform the verify action.
     #
     # @see Driver::Base#verify
@@ -419,8 +447,12 @@ module Kitchen
     def verify_action
       banner "Verifying #{to_str}..."
       elapsed = action(:verify) do |state|
-        if legacy_ssh_base_driver?
+        # use special handling for legacy driver
+        if legacy_ssh_base_driver? && use_legacy_ssh_verifier?(verifier)
           legacy_ssh_base_verify(state)
+        elsif legacy_ssh_base_driver?
+          # read ssh options from legacy driver
+          verifier.call(driver.legacy_state(state))
         else
           verifier.call(state)
         end
@@ -480,14 +512,17 @@ module Kitchen
         synchronize_or_call(what, state, &block)
       end
       state[:last_action] = what.to_s
+      state[:last_error] = nil
       elapsed
     rescue ActionFailed => e
       log_failure(what, e)
+      state[:last_error] = e.class.name
       raise(InstanceFailure, failure_message(what) +
         "  Please see .kitchen/logs/#{name}.log for more details",
         e.backtrace)
     rescue Exception => e # rubocop:disable Lint/RescueException
       log_failure(what, e)
+      state[:last_error] = e.class.name
       raise ActionFailed,
         "Failed to complete ##{what} action: [#{e.message}]", e.backtrace
     ensure

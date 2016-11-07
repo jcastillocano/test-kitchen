@@ -82,7 +82,6 @@ module Kitchen
       merged_data_for(:provisioner, suite, platform).tap do |pdata|
         set_kitchen_config_at!(pdata, :kitchen_root)
         set_kitchen_config_at!(pdata, :test_base_path)
-        set_kitchen_config_at!(pdata, :log_level)
         combine_arrays!(pdata, :run_list, :platform, :suite)
       end
     end
@@ -639,10 +638,11 @@ module Kitchen
     # Destructively moves key Chef configuration key/value pairs from being
     # directly under a suite or platform into a `:provisioner` sub-hash.
     #
-    # There are two key Chef configuration key/value pairs:
+    # There are three key Chef configuration key/value pairs:
     #
     # 1. `:attributes`
     # 2. `:run_list`
+    # 3. `:named_run_list`
     #
     # This method converts the following:
     #
@@ -693,11 +693,13 @@ module Kitchen
       suite_data.each do |suite|
         move_chef_data_to_provisioner_at!(suite, :attributes)
         move_chef_data_to_provisioner_at!(suite, :run_list)
+        move_chef_data_to_provisioner_at!(suite, :named_run_list)
       end
 
       data.fetch(:platforms, []).each do |platform|
         move_chef_data_to_provisioner_at!(platform, :attributes)
         move_chef_data_to_provisioner_at!(platform, :run_list)
+        move_chef_data_to_provisioner_at!(platform, :named_run_list)
       end
     end
 

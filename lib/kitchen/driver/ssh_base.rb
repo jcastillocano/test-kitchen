@@ -19,6 +19,7 @@
 require "thor/util"
 
 require "kitchen/lazy_hash"
+require "benchmark"
 
 module Kitchen
 
@@ -52,6 +53,8 @@ module Kitchen
 
       default_config :sudo, true
       default_config :port, 22
+      # needs to be one less than the configured sshd_config MaxSessions
+      default_config :max_ssh_sessions, 9
 
       # Creates a new Driver object using the provided configuration data
       # which will be merged with any default configuration.
@@ -114,6 +117,16 @@ module Kitchen
       # (see Base#destroy)
       def destroy(state) # rubocop:disable Lint/UnusedMethodArgument
         raise ClientError, "#{self.class}#destroy must be implemented"
+      end
+
+      def legacy_state(state)
+        backcompat_merged_state(state)
+      end
+
+      # Package an instance.
+      #
+      # (see Base#package)
+      def package(state) # rubocop:disable Lint/UnusedMethodArgument
       end
 
       # (see Base#login_command)
@@ -298,10 +311,24 @@ module Kitchen
         return if locals.nil? || Array(locals).empty?
 
         info("Transferring files to #{instance.to_str}")
-        locals.each { |local| connection.upload_path!(local, remote) }
+        debug("TIMING: scp asynch upload (Kitchen::Driver::SSHBase)")
+        elapsed = Benchmark.measure do
+          transfer_path_async(locals, remote, connection)
+        end
+        delta = Util.duration(elapsed.real)
+        debug("TIMING: scp async upload (Kitchen::Driver::SSHBase) took #{delta}")
         debug("Transfer complete")
       rescue SSHFailed, Net::SSH::Exception => ex
         raise ActionFailed, ex.message
+      end
+
+      def transfer_path_async(locals, remote, connection)
+        waits = []
+        locals.map do |local|
+          waits.push connection.upload_path(local, remote)
+          waits.shift.wait while waits.length >= config[:max_ssh_sessions]
+        end
+        waits.each(&:wait)
       end
 
       # Blocks until a TCP socket is available where a remote SSH server

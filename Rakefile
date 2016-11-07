@@ -9,10 +9,14 @@ Rake::TestTask.new(:unit) do |t|
   t.verbose = true
 end
 
-require "cucumber"
-require "cucumber/rake/task"
-Cucumber::Rake::Task.new(:features) do |t|
-  t.cucumber_opts = ["features", "-x", "--format progress", "--no-color"]
+begin
+  require "cucumber"
+  require "cucumber/rake/task"
+  Cucumber::Rake::Task.new(:features) do |t|
+    t.cucumber_opts = ["features", "-x", "--format progress", "--no-color"]
+  end
+rescue LoadError
+  puts "cucumber is not available. (sudo) gem install cucumber to run tests."
 end
 
 desc "Run all test suites"
@@ -26,42 +30,39 @@ task :stats do
   sh "countloc -r spec features"
 end
 
-require "finstyle"
-require "rubocop/rake_task"
-RuboCop::RakeTask.new(:style) do |task|
-  task.options += ["--display-cop-names", "--no-color"]
-end
-
-if RUBY_ENGINE != "jruby"
-  require "cane/rake_task"
-  desc "Run cane to check quality metrics"
-  Cane::RakeTask.new do |cane|
-    cane.canefile = "./.cane"
+begin
+  require "finstyle"
+  require "rubocop/rake_task"
+  RuboCop::RakeTask.new(:style) do |task|
+    task.options += ["--display-cop-names", "--no-color"]
   end
-
-  desc "Run all quality tasks"
-  task :quality => [:cane, :style, :stats]
-else
-  desc "Run all quality tasks"
-  task :quality => [:style, :stats]
+rescue LoadError
+  puts "finstyle/rubocop is not available.  gem install finstyle to do style checking."
 end
 
-require "yard"
-YARD::Rake::YardocTask.new
+desc "Run all quality tasks"
+task :quality => [:style, :stats]
+
+begin
+  require "yard"
+  YARD::Rake::YardocTask.new
+rescue LoadError
+  puts "yard is not available. (sudo) gem install yard to generate yard documentation."
+end
 
 task :default => [:test, :quality]
 
-task :deploy_over_dk do
-  if RUBY_PLATFORM =~ /mswin|mingw|windows/
-    dk_path = File.join(ENV["SYSTEMDRIVE"], "opscode", "chefdk")
-  else
-    dk_path = "/opt/chefdk"
+begin
+  require "github_changelog_generator/task"
+  require "kitchen/version"
+
+  GitHubChangelogGenerator::RakeTask.new :changelog do |config|
+    config.future_release = "v#{Kitchen::VERSION}"
+    config.enhancement_labels = "enhancement,Enhancement,New Feature,Feature,Improvement".split(",")
+    config.bug_labels = "bug,Bug".split(",")
+    config.exclude_labels = %w[Duplicate Question Discussion No_Changelog]
   end
-
-  dk_app_path = File.join(dk_path, %w[embedded apps test-kitchen])
-  FileUtils.copy_entry(File.dirname(__FILE__), dk_app_path)
-  git_dir = File.join(dk_app_path, ".git")
-  FileUtils.rm_rf(git_dir) if Dir.exist?(git_dir)
+rescue LoadError
+  puts "github_changelog_generator is not available." \
+       " gem install github_changelog_generator to generate changelogs"
 end
-
-task :dk_install => [:deploy_over_dk, :install]

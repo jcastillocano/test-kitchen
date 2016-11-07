@@ -26,28 +26,30 @@ Gem::Specification.new do |gem|
   gem.add_dependency "mixlib-shellout", ">= 1.2", "< 3.0"
   gem.add_dependency "net-scp",         "~> 1.1"
   gem.add_dependency "net-ssh",         ">= 2.9", "< 4.0"
+  gem.add_dependency "net-ssh-gateway", "~> 1.2.0"
   gem.add_dependency "safe_yaml",       "~> 1.0"
   gem.add_dependency "thor",            "~> 0.18"
-  gem.add_dependency "mixlib-install",  "~> 0.7"
-  gem.add_dependency "chef-config",     ">= 12.5.1"
+  gem.add_dependency "mixlib-install",  ">= 1.2", "< 3.0"
 
   gem.add_development_dependency "pry"
   gem.add_development_dependency "pry-byebug"
   gem.add_development_dependency "pry-stack_explorer"
-  gem.add_development_dependency "winrm-transport", "~> 1.0", ">= 1.0.3"
-  gem.add_development_dependency "winrm-s", "~> 0.3"
+  gem.add_development_dependency "rb-readline"
+  gem.add_development_dependency "overcommit", "= 0.33.0"
+  gem.add_development_dependency "winrm", "~> 2.0"
+  gem.add_development_dependency "winrm-elevated", "~> 1.0"
+  gem.add_development_dependency "winrm-fs", "~> 1.0"
 
   gem.add_development_dependency "bundler",   "~> 1.3"
-  gem.add_development_dependency "rake"
+  gem.add_development_dependency "rake", "~> 10.0"
+  gem.add_development_dependency "github_changelog_generator", "1.11.3"
 
-  gem.add_development_dependency "aruba",     "~> 0.11.1"
+  gem.add_development_dependency "aruba",     "~> 0.11"
   gem.add_development_dependency "fakefs",    "~> 0.4"
   gem.add_development_dependency "minitest",  "~> 5.3"
   gem.add_development_dependency "mocha",     "~> 1.1"
 
-  # cucumber is getting explicit and aggresive version pin as the behavior of
-  # the aruba and cucumber apis are tightly coupled
-  gem.add_development_dependency "cucumber",  "~> 2.1.0"
+  gem.add_development_dependency "cucumber",  "~> 2.1"
 
   gem.add_development_dependency "countloc",  "~> 0.4"
   gem.add_development_dependency "maruku",    "~> 0.6"
@@ -58,5 +60,4 @@ Gem::Specification.new do |gem|
   # may introduce new and undesireable style choices which would be immediately
   # enforced in CI
   gem.add_development_dependency "finstyle",  "1.5.0"
-  gem.add_development_dependency "cane",      "2.6.2"
 end

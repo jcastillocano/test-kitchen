@@ -157,6 +157,7 @@ describe Kitchen::Provisioner::Base do
       FileUtils.mkdir_p(File.join(provisioner.sandbox_path, "stuff"))
       transport.stubs(:connection).yields(connection)
       connection.stubs(:execute)
+      connection.stubs(:execute_with_retry)
       connection.stubs(:upload)
     end
 
@@ -193,7 +194,7 @@ describe Kitchen::Provisioner::Base do
       connection.expects(:execute).with("install").in_sequence(order)
       connection.expects(:execute).with("init").in_sequence(order)
       connection.expects(:execute).with("prepare").in_sequence(order)
-      connection.expects(:execute).with("run").in_sequence(order)
+      connection.expects(:execute_with_retry).with("run", [], 1, 30).in_sequence(order)
 
       cmd
     end
@@ -326,6 +327,39 @@ describe Kitchen::Provisioner::Base do
         config[:sudo_command] = "blueto -Ohai"
 
         provisioner.send(:sudo, "wakka").must_equal("wakka")
+      end
+    end
+  end
+
+  describe "#sudo_command" do
+
+    describe "with :sudo set" do
+
+      before { config[:sudo] = true }
+
+      it "returns the default sudo_command" do
+        provisioner.send(:sudo_command).must_equal("sudo -E")
+      end
+
+      it "returns the custom sudo_command" do
+        config[:sudo_command] = "mysudo"
+
+        provisioner.send(:sudo_command).must_equal("mysudo")
+      end
+    end
+
+    describe "with :sudo falsey" do
+
+      before { config[:sudo] = false }
+
+      it "returns empty string for default sudo_command" do
+        provisioner.send(:sudo_command).must_equal("")
+      end
+
+      it "returns empty string for custom sudo_command" do
+        config[:sudo_command] = "mysudo"
+
+        provisioner.send(:sudo_command).must_equal("")
       end
     end
   end
